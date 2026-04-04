@@ -1,0 +1,74 @@
+name: data-cleaning-env
+version: "1.0.0"
+description: >
+  A real-world data cleaning and validation environment where an AI agent
+  identifies, corrects, and validates errors in tabular datasets.
+  Tasks range from simple type coercion to complex multi-column consistency checks.
+author: hackathon-participant
+tags:
+  - openenv
+  - data-cleaning
+  - validation
+  - real-world
+  - tabular-data
+
+observation_space:
+  type: object
+  description: Current dataset state with dirty cells, schema info, and validation errors
+  fields:
+    dataset: "List of row dicts representing current table state"
+    schema: "Expected column types and constraints"
+    errors: "List of detected validation errors with row/col references"
+    step_count: "Number of steps taken so far"
+    task_id: "Current task identifier"
+    task_description: "Natural language description of the cleaning objective"
+
+action_space:
+  type: object
+  description: Agent action to clean or transform the dataset
+  fields:
+    action_type: "One of: fix_value, drop_row, fill_missing, normalize_column, mark_done"
+    row_index: "Target row index (optional)"
+    column: "Target column name (optional)"
+    new_value: "Replacement value (optional)"
+    column_transform: "Transformation type: lowercase, strip, to_int, to_float, to_date (optional)"
+
+tasks:
+  - id: task_easy
+    name: "Fix Missing Values & Type Errors"
+    difficulty: easy
+    max_steps: 30
+    description: >
+      A small CSV with 20 rows has missing values and wrong data types.
+      Agent must fill nulls with sensible defaults and coerce columns to correct types.
+
+  - id: task_medium
+    name: "Detect & Repair Duplicates + Outliers"
+    difficulty: medium
+    max_steps: 50
+    description: >
+      A 50-row customer dataset contains duplicate entries and numerical outliers.
+      Agent must deduplicate records and bring outlier values within acceptable ranges.
+
+  - id: task_hard
+    name: "Multi-column Consistency & Referential Integrity"
+    difficulty: hard
+    max_steps: 80
+    description: >
+      A 100-row order dataset with cross-column dependencies (e.g. ship_date >= order_date,
+      total = price * qty). Agent must detect and fix all consistency violations.
+
+reward:
+  type: continuous
+  range: [0.0, 1.0]
+  description: >
+    Partial credit for each error fixed. Penalizes unnecessary changes to correct data,
+    infinite loops, and exceeding max steps. Final score = errors_fixed / total_errors
+    with deductions for collateral damage.
+
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  tasks: GET /tasks
+  validate: GET /health

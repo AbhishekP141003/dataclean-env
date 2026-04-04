@@ -1,0 +1,24 @@
+{
+  "model": "llama-3.3-70b-versatile",
+  "results": [
+    {
+      "task_id": "task_easy",
+      "score": 1.0,
+      "grade": "excellent",
+      "steps": 4
+    },
+    {
+      "task_id": "task_medium",
+      "score": 0.12,
+      "grade": "poor",
+      "steps": 1
+    },
+    {
+      "task_id": "task_hard",
+      "score": 0.0417,
+      "grade": "poor",
+      "steps": 1
+    }
+  ],
+  "average_score": 0.3872
+}
