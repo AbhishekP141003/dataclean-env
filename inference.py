@@ -4,10 +4,11 @@ Follows OpenEnv structured log format: START / STEP / END
 """
 import os
 import json
+import time
 import requests
 from openai import OpenAI
 
-# ── Required environment variables (checklist items 2 & 3) ───────────────────
+# ── Required environment variables ───────────────────────────────────────────
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN     = os.environ.get("HF_TOKEN")          # No default — must be set explicitly
@@ -16,33 +17,30 @@ ENV_URL      = os.environ.get("ENV_URL", "http://localhost:7860")
 # Optional — if you use from_docker_image():
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 
-# ── OpenAI client configured via the required variables (checklist item 4) ───
-client = OpenAI(
-    api_key=HF_TOKEN,
-    base_url=API_BASE_URL,
-)
+# ── OpenAI client ─────────────────────────────────────────────────────────────
+client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
 TASKS = ["task_easy", "task_medium", "task_hard"]
 
-SYSTEM_PROMPT = """You are an expert data cleaning agent. You will receive a dataset with errors and must fix them.
+SYSTEM_PROMPT = """You are a data cleaning agent. Fix dataset errors using ONE JSON action per turn.
 
-Available action_types:
-- fix_value: Fix a specific cell. Requires row_index (int), column (str), new_value (any)
-- drop_row: Drop a duplicate row. Requires row_index (int)
-- fill_missing: Fill all nulls in a column. Requires column (str), new_value (any)
-- normalize_column: Transform a whole column. Requires column (str), column_transform (one of: lowercase, strip, to_int, to_float, to_date)
-- mark_done: Signal that you are finished
+Actions (pick the right one):
+- {"action_type":"fix_value","row_index":N,"column":"col","new_value":X}
+- {"action_type":"drop_row","row_index":N}
+- {"action_type":"fill_missing","column":"col","new_value":X}
+- {"action_type":"normalize_column","column":"col","column_transform":"to_int|to_float|to_date|lowercase|strip"}
+- {"action_type":"mark_done"}
 
-Respond with a single valid JSON object only:
-{
-  "action_type": "<action_type>",
-  "row_index": <int or null>,
-  "column": "<str or null>",
-  "new_value": <value or null>,
-  "column_transform": "<transform or null>"
-}
+RULES FOR EACH ERROR TYPE:
+- missing_value: use fill_missing with a sensible default (0 for numbers, "unknown" for strings)
+- type_error: use normalize_column with to_int or to_float to fix the column
+- duplicate: use drop_row with the duplicate row_index
+- outlier: use fix_value to set purchase_amount to a value <= 10000
+- consistency_total: use fix_value to set total = qty * unit_price (calculate it yourself)
+- date_order: use fix_value to set ship_date to a date AFTER order_date (add 3 days)
+- invalid_enum: use fix_value to set status to one of: pending, shipped, delivered, cancelled
 
-No explanation outside the JSON."""
+Reply with ONE JSON object only. No explanation."""
 
 
 def call_env(method: str, endpoint: str, payload: dict = None) -> dict:
@@ -57,33 +55,63 @@ def call_env(method: str, endpoint: str, payload: dict = None) -> dict:
 
 def build_user_message(obs: dict) -> str:
     errors = obs.get("errors", [])
-    dataset_preview = obs["dataset"][:5]
-    return f"""Task: {obs['task_description']}
+    # Ultra compact — only what's needed to fix the first error
+    slim_errors = [
+        {"row": e.get("row_index"), "col": e.get("column"),
+         "type": e.get("error_type"), "desc": e.get("description", "")[:80]}
+        for e in errors[:3]
+    ]
+    # Get the rows that have errors to help the LLM
+    error_rows = list({e.get("row_index") for e in errors[:3] if e.get("row_index") is not None})
+    relevant_rows = [obs["dataset"][i] for i in error_rows if i < len(obs["dataset"])][:2]
 
-Step: {obs['step_count']}
-Initial errors: {obs['total_errors_initial']}
-Errors fixed so far: {obs['errors_fixed_so_far']}
-Errors remaining: {len(errors)}
+    schema_str = ", ".join(
+        f"{f.get('name')}:{f.get('expected_type')}"
+        for f in obs.get("schema_fields", [])
+    )
+    return (
+        f"Fixed:{obs['errors_fixed_so_far']}/{obs['total_errors_initial']} "
+        f"Remaining:{len(errors)}\n"
+        f"Schema:{schema_str}\n"
+        f"Errors:{json.dumps(slim_errors)}\n"
+        f"Relevant rows:{json.dumps(relevant_rows)}\n"
+        f"Fix the first error. Reply ONE JSON action."
+    )
 
-Current errors (first 10):
-{json.dumps(errors[:10], indent=2)}
 
-Dataset preview (first 5 rows):
-{json.dumps(dataset_preview, indent=2)}
-
-Schema:
-{json.dumps(obs['schema_fields'], indent=2)}
-
-What action will you take next?"""
+def call_llm_with_retry(messages, retries=3):
+    for attempt in range(retries):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=120,
+            )
+            return response.choices[0].message.content.strip(), None
+        except Exception as e:
+            err_str = str(e)
+            if "rate_limit_exceeded" in err_str or "429" in err_str or "413" in err_str:
+                wait = 65 * (attempt + 1)
+                print(json.dumps({
+                    "type": "STEP", "step": 0,
+                    "info": f"Rate limit, waiting {wait}s (retry {attempt+1}/{retries})"
+                }))
+                time.sleep(wait)
+            else:
+                return None, err_str
+    return None, "Max retries exceeded"
 
 
 def run_episode(task_id: str) -> dict:
     obs = call_env("POST", "/reset", {"task_id": task_id})
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    history = []
     done = obs.get("done", False)
     step = 0
+    last_errors_remaining = 9999
+    stuck_count = 0
 
-    # ── START log (required structured format) ───────────────────────────────
     print(json.dumps({
         "type": "START",
         "task_id": task_id,
@@ -93,24 +121,19 @@ def run_episode(task_id: str) -> dict:
 
     while not done:
         user_msg = build_user_message(obs)
-        messages.append({"role": "user", "content": user_msg})
+        # Keep only last 2 turns to save tokens
+        recent = history[-2:] if len(history) > 2 else history
+        messages = [system_msg] + recent + [{"role": "user", "content": user_msg}]
 
-        # LLM call via OpenAI client
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=256,
-            )
-            raw_action = response.choices[0].message.content.strip()
-        except Exception as e:
-            print(json.dumps({"type": "STEP", "step": step, "error": str(e)}))
+        raw_action, err = call_llm_with_retry(messages)
+
+        if err:
+            print(json.dumps({"type": "STEP", "step": step, "error": err}))
             break
 
-        # Parse action JSON
+        # Parse JSON
         try:
-            if raw_action.startswith("```"):
+            if "```" in raw_action:
                 raw_action = raw_action.split("```")[1]
                 if raw_action.startswith("json"):
                     raw_action = raw_action[4:]
@@ -118,9 +141,20 @@ def run_episode(task_id: str) -> dict:
         except json.JSONDecodeError:
             action = {"action_type": "mark_done"}
 
-        messages.append({"role": "assistant", "content": json.dumps(action)})
+        # If stuck (no progress for 5 steps), clear history to reset LLM context
+        errors_now = len(obs.get("errors", []))
+        if errors_now >= last_errors_remaining:
+            stuck_count += 1
+            if stuck_count >= 5:
+                history = []  # reset context so LLM gets fresh view
+                stuck_count = 0
+        else:
+            stuck_count = 0
+            last_errors_remaining = errors_now
 
-        # Apply action to environment
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": json.dumps(action)})
+
         try:
             result = call_env("POST", "/step", action)
         except Exception as e:
@@ -132,7 +166,6 @@ def run_episode(task_id: str) -> dict:
         obs        = result["observation"]
         step      += 1
 
-        # ── STEP log (required structured format) ────────────────────────────
         print(json.dumps({
             "type": "STEP",
             "step": step,
@@ -146,18 +179,14 @@ def run_episode(task_id: str) -> dict:
         if step >= 100:
             break
 
-    # Final grade from deterministic grader
     try:
         grade_result = call_env("GET", "/grade")
-        score = grade_result.get("score", 0.0)
-        grade = grade_result.get("grade", "unknown")
+        score     = grade_result.get("score", 0.0)
+        grade     = grade_result.get("grade", "unknown")
         breakdown = grade_result.get("breakdown", {})
     except Exception:
-        score = 0.0
-        grade = "error"
-        breakdown = {}
+        score, grade, breakdown = 0.0, "error", {}
 
-    # ── END log (required structured format) ─────────────────────────────────
     print(json.dumps({
         "type": "END",
         "task_id": task_id,
@@ -171,7 +200,6 @@ def run_episode(task_id: str) -> dict:
 
 
 def main():
-    # Verify environment is reachable
     try:
         health = call_env("GET", "/health")
         assert health.get("openenv") is True
@@ -186,7 +214,6 @@ def main():
 
     avg = sum(r["score"] for r in results) / len(results)
 
-    # Save baseline results
     with open("baseline_results.json", "w") as f:
         json.dump({
             "model": MODEL_NAME,
