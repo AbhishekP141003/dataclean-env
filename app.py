@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -25,21 +25,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Single global env instance (sufficient for hackathon / single-session use)
 env = DataCleaningEnv()
 
 
 class ResetRequest(BaseModel):
-    task_id: str = "task_easy"
+    task_id: Optional[str] = "task_easy"
 
 
 # ── OpenEnv Core Endpoints ──────────────────────────────────────────────────
 
 @app.post("/reset", response_model=Observation)
-def reset(request: ResetRequest):
-    """Reset the environment and return the initial observation."""
+async def reset(request: Request):
+    """Reset the environment — accepts empty body, JSON body, or task_id param."""
+    task_id = "task_easy"  # safe default
     try:
-        obs = env.reset(task_id=request.task_id)
+        # Try to parse body — if empty or missing, use default
+        body = await request.body()
+        if body:
+            data = await request.json()
+            task_id = data.get("task_id", "task_easy")
+    except Exception:
+        pass  # empty body is fine — use default task_id
+
+    try:
+        obs = env.reset(task_id=task_id)
         return obs
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
