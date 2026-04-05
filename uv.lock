@@ -1,0 +1,19 @@
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "dataclean-env"
+version = "1.0.0"
+source = { editable = "." }
+dependencies = [
+  { name = "fastapi" },
+  { name = "uvicorn" },
+  { name = "pydantic" },
+  { name = "openai" },
+  { name = "requests" },
+  { name = "gradio" },
+  { name = "huggingface-hub" },
+  { name = "python-multipart" },
+  { name = "httpx" },
+  { name = "openenv-core" },
+]
