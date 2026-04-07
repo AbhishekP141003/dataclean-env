@@ -1,8 +1,9 @@
 """
 inference.py — Baseline inference script for DataClean OpenEnv
-Follows OpenEnv structured log format: START / STEP / END
+Structured output format: [START]/[STEP]/[END] blocks to stdout
 """
 import os
+import sys
 import json
 import time
 import requests
@@ -43,6 +44,11 @@ RULES FOR EACH ERROR TYPE:
 Reply with ONE JSON object only. No explanation."""
 
 
+def log(msg, flush=True):
+    """Print to stdout with flush."""
+    print(msg, flush=flush)
+
+
 def call_env(method: str, endpoint: str, payload: dict = None) -> dict:
     url = f"{ENV_URL}{endpoint}"
     if method == "POST":
@@ -55,16 +61,13 @@ def call_env(method: str, endpoint: str, payload: dict = None) -> dict:
 
 def build_user_message(obs: dict) -> str:
     errors = obs.get("errors", [])
-    # Ultra compact — only what's needed to fix the first error
     slim_errors = [
         {"row": e.get("row_index"), "col": e.get("column"),
          "type": e.get("error_type"), "desc": e.get("description", "")[:80]}
         for e in errors[:3]
     ]
-    # Get the rows that have errors to help the LLM
     error_rows = list({e.get("row_index") for e in errors[:3] if e.get("row_index") is not None})
     relevant_rows = [obs["dataset"][i] for i in error_rows if i < len(obs["dataset"])][:2]
-
     schema_str = ", ".join(
         f"{f.get('name')}:{f.get('expected_type')}"
         for f in obs.get("schema_fields", [])
@@ -93,10 +96,7 @@ def call_llm_with_retry(messages, retries=3):
             err_str = str(e)
             if "rate_limit_exceeded" in err_str or "429" in err_str or "413" in err_str:
                 wait = 65 * (attempt + 1)
-                print(json.dumps({
-                    "type": "STEP", "step": 0,
-                    "info": f"Rate limit, waiting {wait}s (retry {attempt+1}/{retries})"
-                }))
+                log(f"[STEP] step=0 reward=0.0 info=rate_limit_wait_{wait}s")
                 time.sleep(wait)
             else:
                 return None, err_str
@@ -111,27 +111,22 @@ def run_episode(task_id: str) -> dict:
     step = 0
     last_errors_remaining = 9999
     stuck_count = 0
+    max_steps = {"task_easy": 30, "task_medium": 50, "task_hard": 80}.get(task_id, 50)
 
-    print(json.dumps({
-        "type": "START",
-        "task_id": task_id,
-        "total_errors": obs.get("total_errors_initial", 0),
-        "max_steps": {"task_easy": 30, "task_medium": 50, "task_hard": 80}.get(task_id, 50),
-    }))
+    # ── [START] block ─────────────────────────────────────────────────────────
+    log(f"[START] task={task_id} total_errors={obs.get('total_errors_initial', 0)} max_steps={max_steps}")
 
     while not done:
         user_msg = build_user_message(obs)
-        # Keep only last 2 turns to save tokens
         recent = history[-2:] if len(history) > 2 else history
         messages = [system_msg] + recent + [{"role": "user", "content": user_msg}]
 
         raw_action, err = call_llm_with_retry(messages)
 
         if err:
-            print(json.dumps({"type": "STEP", "step": step, "error": err}))
+            log(f"[STEP] step={step} reward=0.0 error={err}")
             break
 
-        # Parse JSON
         try:
             if "```" in raw_action:
                 raw_action = raw_action.split("```")[1]
@@ -141,12 +136,12 @@ def run_episode(task_id: str) -> dict:
         except json.JSONDecodeError:
             action = {"action_type": "mark_done"}
 
-        # If stuck (no progress for 5 steps), clear history to reset LLM context
+        # Stuck detection — reset context if no progress for 5 steps
         errors_now = len(obs.get("errors", []))
         if errors_now >= last_errors_remaining:
             stuck_count += 1
             if stuck_count >= 5:
-                history = []  # reset context so LLM gets fresh view
+                history = []
                 stuck_count = 0
         else:
             stuck_count = 0
@@ -158,7 +153,7 @@ def run_episode(task_id: str) -> dict:
         try:
             result = call_env("POST", "/step", action)
         except Exception as e:
-            print(json.dumps({"type": "STEP", "step": step, "error": str(e)}))
+            log(f"[STEP] step={step} reward=0.0 error={str(e)}")
             break
 
         reward_val = result["reward"]["value"]
@@ -166,15 +161,8 @@ def run_episode(task_id: str) -> dict:
         obs        = result["observation"]
         step      += 1
 
-        print(json.dumps({
-            "type": "STEP",
-            "step": step,
-            "action": action.get("action_type"),
-            "reward": round(reward_val, 4),
-            "errors_remaining": len(obs.get("errors", [])),
-            "errors_fixed": obs.get("errors_fixed_so_far", 0),
-            "done": done,
-        }))
+        # ── [STEP] block ──────────────────────────────────────────────────────
+        log(f"[STEP] step={step} reward={round(reward_val, 4)} errors_remaining={len(obs.get('errors', []))} errors_fixed={obs.get('errors_fixed_so_far', 0)} done={done}")
 
         if step >= 100:
             break
@@ -187,14 +175,8 @@ def run_episode(task_id: str) -> dict:
     except Exception:
         score, grade, breakdown = 0.0, "error", {}
 
-    print(json.dumps({
-        "type": "END",
-        "task_id": task_id,
-        "score": round(score, 4),
-        "grade": grade,
-        "total_steps": step,
-        "breakdown": breakdown,
-    }))
+    # ── [END] block ───────────────────────────────────────────────────────────
+    log(f"[END] task={task_id} score={round(score, 4)} grade={grade} steps={step}")
 
     return {"task_id": task_id, "score": score, "grade": grade, "steps": step}
 
@@ -204,8 +186,8 @@ def main():
         health = call_env("GET", "/health")
         assert health.get("openenv") is True
     except Exception as e:
-        print(json.dumps({"type": "ERROR", "message": f"Environment not reachable: {e}"}))
-        exit(1)
+        log(f"[ERROR] Environment not reachable: {e}")
+        sys.exit(1)
 
     results = []
     for task_id in TASKS:
@@ -220,6 +202,8 @@ def main():
             "results": results,
             "average_score": round(avg, 4),
         }, f, indent=2)
+
+    log(f"[DONE] average_score={round(avg, 4)} model={MODEL_NAME}")
 
 
 if __name__ == "__main__":
